@@ -8,6 +8,7 @@
 import json
 import math
 import os
+import random
 import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -24,7 +25,7 @@ from src.recommender.accessibility import (
     match_travel_style,
     build_rag_query,
 )
-from src.recommender.transit import generate_transit_guide, find_nearest_station, get_station_accessibility_text
+from src.recommender.transit import generate_transit_guide, find_nearest_station, get_station_accessibility_text, get_congestion_label
 
 
 def haversine(lat1, lng1, lat2, lng2):
@@ -113,8 +114,8 @@ def rank_and_filter(
             if meta.get("has_parking", 0) == 1:
                 companion_bonus += 0.3
 
-        # 종합 점수: 접근성(60%) + 스타일(30%) + 보너스(10%)
-        total_score = acc_score * 0.6 + style_score * 10 * 0.3 + companion_bonus * 0.1
+    # 종합 점수: 스타일(70%) + 보너스(30%) — 접근성은 필터로만 사용
+        total_score = style_score * 10 * 0.7 + companion_bonus * 0.3
 
         # 카테고리 중복 제한 (스타일 기반)
         cat_count = seen_categories.get(category, 0)
@@ -140,6 +141,17 @@ def rank_and_filter(
         })
 
     scored.sort(key=lambda x: x["total_score"], reverse=True)
+
+    # 상위 후보 내에서 랜덤 셔플 (매번 다른 코스 생성)
+    if len(scored) > 3:
+        top_score = scored[0]["total_score"]
+        threshold = top_score * 0.8
+        top_group = [s for s in scored if s["total_score"] >= threshold]
+        rest = [s for s in scored if s["total_score"] < threshold]
+        random.shuffle(top_group)
+        random.shuffle(rest)
+        scored = top_group + rest
+
     return scored
 
 
@@ -399,11 +411,27 @@ def generate_schedule(route: list, start_hour: int = 10, disability_type: str = 
         nearest_stn_lines = nearest_stns[0][2] if nearest_stns else []
         nearest_stn_acc = get_station_accessibility_text(nearest_stn_name) if nearest_stn_name else ""
 
+        # 역 혼잡도 (여유/보통/혼잡)
+        stn_congestion = get_congestion_label(nearest_stn_name, current_hour, current_min) if nearest_stn_name else None
+
+        # 관광지 소개 (overview)
+        overview = raw.get("overview", "")
+        if not overview:
+            # text 필드에서 overview 추출 시도
+            text = raw.get("text", "")
+            if "[무장애 편의시설]" in text:
+                parts = text.split("[무장애 편의시설]")[0]
+                lines = parts.split("\n", 2)
+                if len(lines) >= 3:
+                    overview = lines[2].strip()
+
         schedule.append({
             "order": i + 1,
             "title": meta.get("title", ""),
             "category": meta.get("category", ""),
             "address": meta.get("address", ""),
+            "overview": overview[:150] if overview else "",
+            "image_url": meta.get("image_url", ""),
             "arrival": arrival,
             "departure": departure,
             "visit_duration_min": visit_min,
@@ -419,10 +447,10 @@ def generate_schedule(route: list, start_hour: int = 10, disability_type: str = 
             "nearest_station_distance_m": nearest_stn_dist,
             "nearest_station_lines": nearest_stn_lines,
             "nearest_station_accessibility": nearest_stn_acc,
+            "nearest_station_congestion": stn_congestion,
             "transit_to_next": transit_info,
             "lat": meta.get("lat", 0),
             "lng": meta.get("lng", 0),
-            "image_url": meta.get("image_url", ""),
         })
 
         next_total = end_hour * 60 + end_min + travel_min
@@ -442,6 +470,7 @@ def recommend(onboarding: dict) -> dict:
         "group_size": "2인",          # 1인|2인|3인|4인이상
         "companion": "가족과",        # 친구와|가족과|커플|혼자
         "travel_style": "역사/문화",  # 쇼핑|미식|힐링|역사/문화
+        "district": "종로구",         # 시작 지역구 (선택)
     }
     """
     print(f"\n{'='*60}")
@@ -466,23 +495,109 @@ def recommend(onboarding: dict) -> dict:
 
     print(f"\n[STEP 4] 코스 장소 선정 (구간 최대 5km, 최대 {4 if onboarding.get('disability_type') not in ['보행','노인'] else 3}곳)")
 
-    # 최고 점수 장소 기준으로 반경 8km 이내 후보를 raw_dict 전체에서 확보
     from config import STYLE_RATIO
     ratio_cfg = STYLE_RATIO.get(onboarding.get("travel_style", ""), {})
     step4_primary_cats = ratio_cfg.get("primary_cats", [])
     step4_sub_cats = ratio_cfg.get("sub_cats", [])
-    # 청각/지적 등 접근성 점수가 낮은 유형은 임계값을 내림
     step4_min_acc = {
         "보행": 1.0, "시각": 0.5, "청각": 0.0,
         "지적": 0.0, "유아동반": 0.5, "노인": 0.5,
     }.get(onboarding.get("disability_type", ""), 0.5)
 
+    district = onboarding.get("district", "")
+
+    # 지역구 선택 시: 해당 구의 중심 좌표를 앵커로 사용
+    if district:
+        # 해당 구의 모든 장소에서 중심점 계산
+        district_lats = []
+        district_lngs = []
+        for raw in raw_dict.values():
+            if district in raw.get("address", ""):
+                rlat = float(raw.get("latitude", 0))
+                rlng = float(raw.get("longitude", 0))
+                if rlat and rlng:
+                    district_lats.append(rlat)
+                    district_lngs.append(rlng)
+
+        if district_lats:
+            anchor_lat = sum(district_lats) / len(district_lats)
+            anchor_lng = sum(district_lngs) / len(district_lngs)
+        else:
+            anchor_lat = scored[0]["metadata"].get("lat", 0) if scored else 37.5665
+            anchor_lng = scored[0]["metadata"].get("lng", 0) if scored else 126.9780
+
+        # 반경 5km 이내 장소를 모두 후보로 (선택 구 + 인접 구 자동 포함)
+        DISTRICT_RADIUS_KM = 5.0
+        scored_ids = {s["metadata"].get("id") for s in scored}
+        district_extra = []
+        covered_districts = set()
+        for sid, raw in raw_dict.items():
+            if sid in scored_ids:
+                continue
+            rlat = float(raw.get("latitude", 0))
+            rlng = float(raw.get("longitude", 0))
+            if not rlat or not rlng:
+                continue
+            dist_from_center = haversine(anchor_lat, anchor_lng, rlat, rlng)
+            if dist_from_center > DISTRICT_RADIUS_KM:
+                continue
+            acc_score = compute_accessibility_score(raw, onboarding.get("disability_type", ""))
+            if acc_score < step4_min_acc:
+                continue
+            category = raw.get("category", "")
+            if step4_primary_cats:
+                if category not in step4_primary_cats and category not in step4_sub_cats:
+                    continue
+            style = onboarding.get("travel_style", "")
+            style_score = match_travel_style(category, style) if style else 0.3
+            total_score = style_score * 10 * 0.7
+            # 같은 구 장소에 보너스
+            addr = raw.get("address", "")
+            if district in addr:
+                total_score += 1.0
+            from langchain_core.documents import Document
+            fake_meta = {
+                "id": sid,
+                "title": raw.get("title", ""),
+                "category": category,
+                "address": addr,
+                "lat": rlat, "lng": rlng,
+                "image_url": raw.get("image_url", ""),
+            }
+            district_extra.append({
+                "doc": Document(page_content="", metadata=fake_meta),
+                "metadata": fake_meta,
+                "raw_spot": raw,
+                "accessibility_score": acc_score,
+                "style_score": style_score,
+                "total_score": total_score,
+                "category": category,
+            })
+            # 커버되는 구 이름 수집
+            import re
+            m = re.search(r'서울특별시\s+(\S+구)', addr)
+            if m:
+                covered_districts.add(m.group(1))
+
+        # 지역구 장소 우선 (scored에서 반경 내 + 보충분)
+        nearby_scored = [s for s in scored if haversine(
+            anchor_lat, anchor_lng,
+            s["metadata"].get("lat", 0), s["metadata"].get("lng", 0)
+        ) <= DISTRICT_RADIUS_KM]
+        far_scored = [s for s in scored if s not in nearby_scored]
+        random.shuffle(district_extra)
+        scored = nearby_scored + district_extra + far_scored
+        print(f"  시작 지역: {district} (반경 {DISTRICT_RADIUS_KM}km)")
+        print(f"  포함 지역: {', '.join(sorted(covered_districts))}")
+        print(f"  후보: scored {len(nearby_scored)}개 + 보충 {len(district_extra)}개")
+    else:
+        anchor_lat = scored[0]["metadata"].get("lat", 0) if scored else 37.5665
+        anchor_lng = scored[0]["metadata"].get("lng", 0) if scored else 126.9780
+
+    # 앵커 기준 반경 8km 이내 추가 후보
     if scored:
-        anchor_lat = scored[0]["metadata"].get("lat", 0)
-        anchor_lng = scored[0]["metadata"].get("lng", 0)
         extra_candidates = []
         for sid, raw in raw_dict.items():
-            # 이미 scored에 있으면 skip
             if any(s["metadata"].get("id") == sid for s in scored):
                 continue
             rlat = float(raw.get("latitude", 0))
@@ -491,26 +606,25 @@ def recommend(onboarding: dict) -> dict:
                 continue
             dist = haversine(anchor_lat, anchor_lng, rlat, rlng)
             if dist <= 8.0:
+                if district and district not in raw.get("address", "") and dist > 4.0:
+                    continue
                 acc_score = compute_accessibility_score(raw, onboarding.get("disability_type", ""))
                 if acc_score < step4_min_acc:
                     continue
                 category = raw.get("category", "")
-                # 주요/보조 카테고리가 아니면 스킵 (스타일에 맞는 장소만)
                 if step4_primary_cats:
                     if category not in step4_primary_cats and category not in step4_sub_cats:
                         continue
                 style = onboarding.get("travel_style", "")
                 style_score = match_travel_style(category, style) if style else 0.3
-                total_score = acc_score * 0.5 + style_score * 10 * 0.3
-                # 가짜 doc 구조로 변환
+                total_score = style_score * 10 * 0.7
                 from langchain_core.documents import Document
                 fake_meta = {
                     "id": sid,
                     "title": raw.get("title", ""),
                     "category": category,
                     "address": raw.get("address", ""),
-                    "lat": rlat,
-                    "lng": rlng,
+                    "lat": rlat, "lng": rlng,
                     "image_url": raw.get("image_url", ""),
                 }
                 extra_candidates.append({
@@ -522,7 +636,6 @@ def recommend(onboarding: dict) -> dict:
                     "total_score": total_score,
                     "category": category,
                 })
-        # scored 뒤에 추가 후보 병합 (중복 없이)
         print(f"  반경 8km 추가 후보: {len(extra_candidates)}개")
         scored_extended = scored + sorted(extra_candidates, key=lambda x: x["total_score"], reverse=True)
     else:
@@ -559,6 +672,8 @@ def recommend(onboarding: dict) -> dict:
     print(f"  장애 유형: {onboarding.get('disability_type', '-')}")
     print(f"  여행 스타일: {onboarding.get('travel_style', '-')}")
     print(f"  동반자: {onboarding.get('companion', '-')} ({onboarding.get('group_size', '-')})")
+    if onboarding.get('district'):
+        print(f"  시작 지역: {onboarding.get('district')}")
     print(f"  추천 장소: {len(schedule)}개")
     print(f"  총 이동 거리: {total_distance:.1f}km")
     print(f"  총 소요 시간: {total_time}분 ({total_time//60}시간 {total_time%60}분)")
@@ -566,27 +681,31 @@ def recommend(onboarding: dict) -> dict:
 
     for s in schedule:
         print(f"\n  [{s['order']}] {s['title']} ({s['category']})")
-        print(f"      📍 {s.get('address', '')}")
+        print(f"      주소: {s.get('address', '')}")
+        if s.get('overview'):
+            print(f"      소개: {s['overview']}")
+        if s.get('image_url'):
+            print(f"      이미지: {s['image_url']}")
         print(f"      시간: {s['arrival']} ~ {s['departure']} ({s['visit_duration_min']}분)")
         print(f"      접근성 점수: {s['accessibility_score']}/10")
-        # 가까운 지하철역
         if s.get('nearest_station'):
             stn = s['nearest_station']
             lines = ', '.join(s.get('nearest_station_lines', []))
             dist_m = s.get('nearest_station_distance_m', 0)
-            print(f"      🚇 가까운 역: {stn}역 ({lines}) - 도보 {dist_m}m")
+            cong = s.get('nearest_station_congestion', '')
+            cong_str = f" | 혼잡도: {cong}" if cong else ""
+            print(f"      [지하철] {stn}역 ({lines}) - 도보 {dist_m}m{cong_str}")
             if s.get('nearest_station_accessibility'):
-                print(f"         ♿ {s['nearest_station_accessibility']}")
+                print(f"         편의시설: {s['nearest_station_accessibility']}")
         if s['accessibility_summary']:
             for line in s['accessibility_summary'][:3]:
-                print(f"      ✓ {line}")
+                print(f"      - {line}")
         if s['lowbus_info']:
-            print(f"      🚌 {s['lowbus_info'][:120]}")
-        # 다음 장소 교통 안내
+            print(f"      [저상버스] {s['lowbus_info'][:120]}")
         transit = s.get('transit_to_next', {})
         if transit:
             print(f"\n      {transit.get('guide_text', '')}")
             if transit.get('accessibility_note'):
-                print(f"      💡 {transit['accessibility_note']}")
+                print(f"      [TIP] {transit['accessibility_note']}")
 
     return result

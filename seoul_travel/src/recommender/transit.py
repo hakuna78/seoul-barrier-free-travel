@@ -122,7 +122,7 @@ _congestion_cache = None
 
 def _load_congestion_data():
     """지하철 혼잡도 데이터 로드 (역별 평균)"""
-    path = os.path.join(SEOUL_TRAVEL_DIR, "서울교통공사_지하철혼잡도정보_20260331.json")
+    path = os.path.join(SEOUL_TRAVEL_DIR, "subway_congestion.json")
     if not os.path.exists(path):
         return {}
 
@@ -154,8 +154,20 @@ def _load_congestion_data():
 
     return congestion
 
+def _congestion_to_label(value):
+    """혼잡도 수치를 여유/보통/혼잡 텍스트로 변환"""
+    if value is None:
+        return None
+    if value < 40:
+        return "여유"
+    elif value < 70:
+        return "보통"
+    else:
+        return "혼잡"
+
+
 def get_congestion_level(station_name, hour, minute):
-    """해당 시간대의 역 혼잡도 반환"""
+    """해당 시간대의 역 혼잡도 수치 반환"""
     global _congestion_cache
     if _congestion_cache is None:
         _congestion_cache = _load_congestion_data()
@@ -173,6 +185,12 @@ def get_congestion_level(station_name, hour, minute):
         time_key = f"00시{m}분"
 
     return _congestion_cache[stn].get(time_key, None)
+
+
+def get_congestion_label(station_name, hour, minute):
+    """해당 시간대의 역 혼잡도를 여유/보통/혼잡 텍스트로 반환"""
+    value = get_congestion_level(station_name, hour, minute)
+    return _congestion_to_label(value)
 
 
 def haversine(lat1, lng1, lat2, lng2):
@@ -198,7 +216,7 @@ def find_nearest_station(lat, lng, top_n=2):
 
 def _load_subway_accessibility():
     """교통약자이용정보.json에서 역별 엘리베이터/에스컬레이터 정보 로드"""
-    path = os.path.join(SEOUL_TRAVEL_DIR, "교통약자이용정보.json")
+    path = os.path.join(SEOUL_TRAVEL_DIR, "station_accessibility.json")
     if not os.path.exists(path):
         return {}
 
@@ -328,13 +346,20 @@ def generate_transit_guide(
     from_title = from_spot.get('title','')
     to_title = to_spot.get('title','')
 
+    # 모든 경로에 출발역 혼잡도 포함
+    from_cong = get_congestion_label(from_stn_name, start_hour, start_min)
+    from_cong_str = f" (혼잡도: {from_cong})" if from_cong else ""
+
     if dist < 0.8:
         # 도보
         est_time = int(dist * 15)
         if disability_type in ["보행", "노인"]:
             est_time = int(dist * 20)
         recommended = "도보"
-        guide_text = f"<{from_title} → {to_title}: 도보 약 {max(est_time, 3)}분>"
+        guide_text = (
+            f"<{from_title} → {to_title}: 도보 약 {max(est_time, 3)}분>\n"
+            f"[{from_stn_name}역] 인근{from_cong_str}"
+        )
 
     elif dist < 3.0:
         # 버스
@@ -346,26 +371,26 @@ def generate_transit_guide(
             bus_str = f"저상버스 {routes[0]}번" if routes else "저상버스"
             guide_text = (
                 f"<{from_title} → {to_title}: 버스 약 {est_time}분>\n"
-                f"또는 [{closest_stop.get('name','')} 정류장]에서 {bus_str} 탑승"
+                f"[{closest_stop.get('name','')} 정류장]에서 {bus_str} 탑승\n"
+                f"[{from_stn_name}역] 인근{from_cong_str}"
             )
         else:
-            guide_text = f"<{from_title} → {to_title}: 버스 약 {est_time}분>"
+            guide_text = (
+                f"<{from_title} → {to_title}: 버스 약 {est_time}분>\n"
+                f"[{from_stn_name}역] 인근{from_cong_str}"
+            )
             
     else:
         # 지하철
         est_time = int(max(15, dist * 5))
         recommended = "지하철"
         
-        # 혼잡도 확인
-        congestion = get_congestion_level(from_stn_name, start_hour, start_min)
-        cong_str = f"(혼잡도: {congestion:.1f}%)" if congestion else ""
-        
         common_lines = set(from_stn_lines) & set(to_stn_lines)
         line_str = f"{list(common_lines)[0]}" if common_lines else f"{from_stn_lines[0]}"
         
         guide_text = (
             f"<{from_title} → {to_title}: 지하철 약 {est_time}분>\n"
-            f"또는 [{from_stn_name}역]에서 {line_str} 탑승 {cong_str}"
+            f"[{from_stn_name}역]에서 {line_str} 탑승{from_cong_str}"
         )
 
         if not common_lines:
@@ -383,13 +408,14 @@ def generate_transit_guide(
         acc_note = "유모차 이용 시 엘리베이터를 이용하세요. 저상버스를 우선 이용하시기 바랍니다."
 
     if from_stn_acc and recommended == "지하철":
-        guide_text += f"\n  ♿ 역 편의시설: {from_stn_acc}"
+        guide_text += f"\n  편의시설: {from_stn_acc}"
 
     return {
         "distance_km": round(dist, 1),
         "estimated_time_min": est_time,
         "recommended_transit": recommended,
         "guide_text": guide_text,
+        "congestion_label": from_cong,
         "from_station": {
             "name": from_stn_name,
             "distance_m": round(from_stn_dist * 1000),
@@ -412,3 +438,4 @@ def generate_transit_guide(
         ],
         "accessibility_note": acc_note,
     }
+
